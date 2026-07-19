@@ -12,6 +12,11 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Package name reported to Qefro Runtime (`X-Qefro-SDK` / protocol payloads).
+pub const SDK_NAME: &str = "qefro-backend-sdk";
+/// Package version reported to Qefro Runtime (`sdk_version` / `X-Qefro-Version`).
+pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 type ToolHandler = Arc<dyn Fn(ToolContext) -> ToolFuture + Send + Sync>;
 type ToolFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>>;
 
@@ -301,7 +306,7 @@ impl Qefro {
         match request.request_type.as_str() {
             "ping" => QefroResponse::Pong {
                 protocol_version: self.config.protocol_version.clone(),
-                sdk_version: "0.1.0".into(),
+                sdk_version: SDK_VERSION.into(),
             },
             "tools.list" => QefroResponse::ToolsList {
                 tools: self
@@ -318,7 +323,7 @@ impl Qefro {
                     })
                     .collect(),
                 protocol_version: self.config.protocol_version.clone(),
-                sdk_version: "0.1.0".into(),
+                sdk_version: SDK_VERSION.into(),
             },
             "tool.invoke" => {
                 self
