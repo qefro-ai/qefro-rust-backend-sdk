@@ -1,9 +1,16 @@
 [package]
-name = "qefro-sdk"
-version = "0.1.0"
+name = "qefro-backend-sdk"
+version = "1.0.0"
 edition = "2021"
-description = "Qefro backend SDK for business tool handlers"
+description = "Qefro backend framework for business tool handlers and customer authorization orchestration"
 license = "MIT"
+readme = "README.md"
+homepage = "https://docs.qefro.com/docs/guides/register-sdk-business-tools"
+repository = "https://github.com/qefro-ai/qefro-rust-backend-sdk"
+documentation = "https://docs.rs/qefro-backend-sdk"
+keywords = ["qefro", "ai", "sdk", "business-tools", "customer-support"]
+categories = ["web-programming", "api-bindings"]
+rust-version = "1.70"
 
 [dependencies]
 anyhow = "1"
