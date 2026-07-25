@@ -4,29 +4,86 @@ Qefro backend framework for Business Tool handlers and customer authorization (R
 
 Organizations expose one signed webhook (typically `POST /qefro`). Qefro Runtime calls `ping`, `tools.list`, `tool.invoke`, and `tool.resume`. Authentication stays in your handlers — Qefro only relays challenges.
 
-Companion TypeScript package: [`@qefro-ai/backend`](https://www.npmjs.com/package/@qefro-ai/backend).
+Companion TypeScript package: [`@qefro-ai/backend`](https://www.npmjs.com/package/@qefro-ai/backend) (feature-parity target).
 
 ## Install
 
 ```toml
 [dependencies]
 qefro-backend-sdk = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
 ```bash
 cargo add qefro-backend-sdk
 ```
 
+## Quick start
+
+```rust
+use qefro_backend_sdk::{ListenOptions, Qefro, QefroConfig, ToolAuthMode, ToolLookup, ToolMetadata};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let app = Qefro::new(QefroConfig::new(std::env::var("QEFRO_SIGNING_SECRET")?));
+
+    app.tool(
+        ToolMetadata {
+            name: "order_status_check".into(),
+            description: Some("Look up order status by ID".into()),
+            auth: ToolAuthMode::None,
+            lookup: Some(ToolLookup {
+                by: Some("email".into()),
+                required: vec![],
+            }),
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": { "order_id": { "type": "string" } },
+                "required": ["order_id"]
+            })),
+            ..Default::default()
+        },
+        |ctx| async move {
+            Ok(json!({
+                "order_id": ctx.parameters.get("order_id"),
+                "status": "shipped"
+            }))
+        },
+    );
+
+    let handle = app.listen(ListenOptions { port: 8088, host: None, path: None }).await?;
+    println!("listening on {}", handle.url);
+    tokio::signal::ctrl_c().await?;
+    handle.close().await;
+    Ok(())
+}
+```
+
+Set the same signing secret in Admin Console → **Business Tools → SDK Connections**, then **Sync Tools**.
+
 ## Docs
 
 - [Register SDK Business Tools](https://docs.qefro.com/docs/guides/register-sdk-business-tools)
 - [docs.rs/qefro-backend-sdk](https://docs.rs/qefro-backend-sdk)
+
+## Protocol
+
+| Message | Purpose |
+| --- | --- |
+| `ping` | Health / Test Connection |
+| `tools.list` | Discover handlers for Sync Tools (includes `lookup`) |
+| `tool.invoke` | Run a handler |
+| `tool.resume` | Continue after a customer challenge reply |
+
+Requests are HMAC-SHA256 signed (`X-Qefro-Signature` / `X-Qefro-Timestamp`). Responses include `X-Qefro-Protocol`, `X-Qefro-SDK`, and `X-Qefro-Version`.
 
 ## Build
 
 ```bash
 cargo build
 cargo test
+cargo run --example basic
 ```
 
 ## Publishing (maintainers)

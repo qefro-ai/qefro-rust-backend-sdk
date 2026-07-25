@@ -9,7 +9,7 @@ From crates.io (recommended):
 ```toml
 [dependencies]
 qefro-backend-sdk = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 serde_json = "1"
 anyhow = "1"
 async-trait = "0.1"
@@ -21,7 +21,7 @@ This example uses a path dependency on the local crate for development.
 
 ```bash
 export QEFRO_SIGNING_SECRET=dev-secret
-cargo run
+cargo run --example basic
 ```
 
-Then create an SDK Connection pointing at your public `/qefro` webhook (or tunnel) with the same secret.
+Then create an SDK Connection pointing at your public `/qefro` webhook (or tunnel) with the same secret. `tools.list` advertises `lookup: { required: ["email"] }` for identity resolution.
