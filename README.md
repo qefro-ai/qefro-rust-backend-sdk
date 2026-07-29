@@ -2,7 +2,7 @@
 
 Qefro backend framework for Business Tool handlers and customer authorization (Rust).
 
-Organizations expose one signed webhook (typically `POST /qefro`). Qefro Runtime calls `ping`, `tools.list`, `tool.invoke`, and `tool.resume`. Authentication stays in your handlers — Qefro only relays challenges.
+Organizations expose one signed webhook (typically `POST /qefro`). Qefro Runtime calls `ping`, `capabilities.list`, `tool.invoke`, and `tool.resume`. Authentication stays in your handlers — Qefro only relays challenges.
 
 Companion TypeScript package: [`@qefro-ai/backend`](https://www.npmjs.com/package/@qefro-ai/backend) (feature-parity target).
 
@@ -62,9 +62,36 @@ async fn main() -> anyhow::Result<()> {
 
 Set the same signing secret in Admin Console → **Business Tools → SDK Connections**, then **Sync Tools**.
 
+## Business Flows
+
+Flows describe how your Business Tools are orchestrated. They are **metadata only** — the SDK advertises them through `capabilities.list` and the Qefro Runtime discovers, validates, versions, and (later) executes them. Nothing runs inside the SDK. A flow with a duplicate/empty id (flow or step) is excluded from `capabilities.list` and surfaced through `FlowError` instead of panicking.
+
+```rust
+use qefro_backend_sdk::BusinessFlowMetadata;
+
+app.flow(BusinessFlowMetadata {
+    id: "order_lookup".into(),        // immutable identity — renaming `name` never creates a new flow
+    name: Some("Order Lookup".into()),
+    description: Some("Lookup customer orders".into()),
+    category: Some("crm".into()),
+    tags: vec!["customer".into(), "orders".into()],
+    intent: vec!["track order".into(), "where is my order".into()],
+    inputs: vec!["email".into()],
+    outputs: vec!["customer".into(), "orders".into()],
+    ..Default::default()
+})?
+.ask("email", "email", "Please enter your email.")
+.tool("lookup", "lookup_customer")
+.tool("orders", "get_orders")
+.complete("done", Some("Here are your recent orders.".into()))?;
+```
+
+Every step needs a unique `id`; `tool` steps reference an existing Business Tool by `tool_ref`. Step builders: `.ask() .tool() .challenge() .upload() .condition() .delay() .approval() .complete()`. See [`examples/basic`](examples/basic).
+
 ## Docs
 
 - [Register SDK Business Tools](https://docs.qefro.com/docs/guides/register-sdk-business-tools)
+- [Define Business Flows](https://docs.qefro.com/docs/guides/define-business-flows)
 - [docs.rs/qefro-backend-sdk](https://docs.rs/qefro-backend-sdk)
 
 ## Protocol
@@ -72,7 +99,8 @@ Set the same signing secret in Admin Console → **Business Tools → SDK Connec
 | Message | Purpose |
 | --- | --- |
 | `ping` | Health / Test Connection |
-| `tools.list` | Discover handlers for Sync Tools (includes `lookup`) |
+| `capabilities.list` | Discover tools **and** business flows for Sync Tools (includes `lookup`) |
+| `tools.list` | Legacy tool-only discovery (still supported) |
 | `tool.invoke` | Run a handler |
 | `tool.resume` | Continue after a customer challenge reply |
 

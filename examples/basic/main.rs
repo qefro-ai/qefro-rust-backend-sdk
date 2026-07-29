@@ -1,8 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use qefro_backend_sdk::{
-    AuthBuilder, AuthenticationContextPayload, CustomerAuthorizeContext, CustomerLookupContext,
-    CustomerProvider, ListenOptions, Qefro, QefroConfig, ToolAuthMode, ToolLookup, ToolMetadata,
+    AuthBuilder, AuthenticationContextPayload, BusinessFlowMetadata, CustomerAuthorizeContext,
+    CustomerLookupContext, CustomerProvider, ListenOptions, Qefro, QefroConfig, ToolAuthMode,
+    ToolLookup, ToolMetadata,
 };
 use serde_json::{json, Value};
 
@@ -70,6 +71,28 @@ async fn main() -> Result<()> {
             Ok(json!([{ "orderId": "ord_1", "customerId": customer_id }]))
         },
     );
+
+    // Business Flows are metadata only: advertised through `capabilities.list`
+    // and orchestrated by the Qefro Runtime. `?` surfaces builder mistakes at
+    // startup instead of panicking.
+    app.flow(BusinessFlowMetadata {
+        id: "order_lookup".into(),
+        name: Some("Order Lookup".into()),
+        description: Some("Lookup customer orders".into()),
+        category: Some("crm".into()),
+        tags: vec!["customer".into(), "orders".into()],
+        intent: vec![
+            "track order".into(),
+            "where is my order".into(),
+            "find my shipment".into(),
+        ],
+        inputs: vec!["email".into()],
+        outputs: vec!["customer".into(), "orders".into()],
+        ..Default::default()
+    })?
+    .ask("email", "email", "Please enter your email.")
+    .tool("orders", "get_orders")
+    .complete("done", Some("Here are your recent orders.".into()))?;
 
     let port = std::env::var("PORT")
         .ok()

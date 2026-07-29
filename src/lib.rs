@@ -159,6 +159,130 @@ pub struct RegisteredTool {
     pub lookup: Option<ToolLookup>,
 }
 
+// ---------------------------------------------------------------------------
+// Business Flows (metadata only — the SDK advertises them, never executes them)
+// ---------------------------------------------------------------------------
+
+fn default_flow_version() -> u32 {
+    1
+}
+
+/// Immutable identity + descriptive metadata for a Business Flow.
+///
+/// `id` is the identity key: renaming `name` never creates a new flow.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BusinessFlowMetadata {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Integer flow version, defaults to 1. Bump when the definition changes.
+    #[serde(default = "default_flow_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Example utterances used by the runtime for AI flow selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent: Vec<String>,
+    /// Identity/context attributes this flow requires before it can run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+    /// Values this flow produces (for analytics and future flow chaining).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<String>,
+}
+
+/// Type-specific settings for a flow step. Serialized as `{ "type": ..., "config": {...} }`
+/// so new settings (retry, timeout, permissions, parallel) extend `config` without
+/// changing the wire schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "config", rename_all = "snake_case")]
+pub enum FlowStepKind {
+    Ask {
+        field: String,
+        prompt: String,
+    },
+    Tool {
+        /// Name of an existing Business Tool. Namespaceable later (e.g. `CRM.lookup_customer`).
+        tool_ref: String,
+    },
+    Challenge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    Upload {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        accept: Vec<String>,
+    },
+    Condition {
+        when: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        then: Option<String>,
+        #[serde(rename = "else", default, skip_serializing_if = "Option::is_none")]
+        else_step: Option<String>,
+    },
+    Delay {
+        duration_seconds: u64,
+    },
+    Approval {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+    Complete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+/// Wire shape of a flow step: `{ id, type, config }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FlowStep {
+    pub id: String,
+    #[serde(flatten)]
+    pub kind: FlowStepKind,
+}
+
+/// A Business Flow as advertised through `capabilities.list`. Never executed by the SDK.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BusinessFlow {
+    pub metadata: BusinessFlowMetadata,
+    pub steps: Vec<FlowStep>,
+}
+
+/// Developer mistakes surfaced as explicit errors — the SDK never panics on a
+/// malformed flow declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowError {
+    EmptyFlowId,
+    DuplicateFlowId(String),
+    EmptyStepId { flow: String },
+    DuplicateStepId { flow: String, step: String },
+}
+
+impl std::fmt::Display for FlowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlowError::EmptyFlowId => write!(f, "flow() requires a non-empty metadata.id"),
+            FlowError::DuplicateFlowId(id) => write!(f, "flow \"{id}\" is already registered"),
+            FlowError::EmptyStepId { flow } => {
+                write!(f, "flow \"{flow}\": every step requires a non-empty id")
+            }
+            FlowError::DuplicateStepId { flow, step } => {
+                write!(f, "flow \"{flow}\": duplicate step id \"{step}\"")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FlowError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthenticationContextPayload {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -215,6 +339,14 @@ pub enum QefroResponse {
         tools: Vec<RegisteredTool>,
         protocol_version: String,
         sdk_version: String,
+    },
+    #[serde(rename = "capabilities.list")]
+    CapabilitiesList {
+        tools: Vec<RegisteredTool>,
+        flows: Vec<BusinessFlow>,
+        protocol_version: String,
+        sdk_version: String,
+        sdk_name: String,
     },
     Result {
         output: Value,
@@ -411,6 +543,126 @@ struct ToolRegistration {
     handler: ToolHandler,
 }
 
+#[derive(Clone)]
+struct FlowRegistration {
+    metadata: BusinessFlowMetadata,
+    steps: Vec<FlowStep>,
+    /// First builder violation recorded for this flow; if set the flow is
+    /// excluded from `capabilities.list`.
+    error: Option<FlowError>,
+}
+
+/// Fluent builder returned by [`Qefro::flow`]. Step methods append into the SDK's
+/// flow registry as they are declared and never panic; the first step-id
+/// violation is recorded and surfaced by [`FlowBuilder::complete`].
+pub struct FlowBuilder {
+    inner: Arc<Inner>,
+    flow_id: String,
+}
+
+impl FlowBuilder {
+    pub fn ask(self, id: impl Into<String>, field: impl Into<String>, prompt: impl Into<String>) -> Self {
+        self.push(
+            id.into(),
+            FlowStepKind::Ask {
+                field: field.into(),
+                prompt: prompt.into(),
+            },
+        )
+    }
+
+    pub fn tool(self, id: impl Into<String>, tool_ref: impl Into<String>) -> Self {
+        self.push(
+            id.into(),
+            FlowStepKind::Tool {
+                tool_ref: tool_ref.into(),
+            },
+        )
+    }
+
+    pub fn challenge(self, id: impl Into<String>, message: Option<String>) -> Self {
+        self.push(id.into(), FlowStepKind::Challenge { message })
+    }
+
+    pub fn upload(
+        self,
+        id: impl Into<String>,
+        field: Option<String>,
+        prompt: Option<String>,
+        accept: Vec<String>,
+    ) -> Self {
+        self.push(
+            id.into(),
+            FlowStepKind::Upload {
+                field,
+                prompt,
+                accept,
+            },
+        )
+    }
+
+    pub fn condition(
+        self,
+        id: impl Into<String>,
+        when: impl Into<String>,
+        then: Option<String>,
+        else_step: Option<String>,
+    ) -> Self {
+        self.push(
+            id.into(),
+            FlowStepKind::Condition {
+                when: when.into(),
+                then,
+                else_step,
+            },
+        )
+    }
+
+    pub fn delay(self, id: impl Into<String>, duration_seconds: u64) -> Self {
+        self.push(id.into(), FlowStepKind::Delay { duration_seconds })
+    }
+
+    pub fn approval(self, id: impl Into<String>, prompt: Option<String>) -> Self {
+        self.push(id.into(), FlowStepKind::Approval { prompt })
+    }
+
+    /// Append the terminal `complete` step and surface any recorded builder error.
+    #[must_use = "handle the FlowError so malformed flows fail fast at startup"]
+    pub fn complete(self, id: impl Into<String>, message: Option<String>) -> Result<(), FlowError> {
+        let flow_id = self.flow_id.clone();
+        let inner = self.inner.clone();
+        let _ = self.push(id.into(), FlowStepKind::Complete { message });
+        let flows = inner.flows.read().expect("flows");
+        match flows.get(&flow_id).and_then(|r| r.error.clone()) {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn push(self, id: String, kind: FlowStepKind) -> Self {
+        let step_id = id.trim().to_string();
+        let mut flows = self.inner.flows.write().expect("flows");
+        if let Some(reg) = flows.get_mut(&self.flow_id) {
+            if reg.error.is_none() {
+                if step_id.is_empty() {
+                    reg.error = Some(FlowError::EmptyStepId {
+                        flow: self.flow_id.clone(),
+                    });
+                } else if reg.steps.iter().any(|s| s.id == step_id) {
+                    reg.error = Some(FlowError::DuplicateStepId {
+                        flow: self.flow_id.clone(),
+                        step: step_id.clone(),
+                    });
+                } else {
+                    reg.steps.push(FlowStep { id: step_id, kind });
+                }
+            }
+        }
+        drop(flows);
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ListenOptions {
     pub port: u16,
@@ -438,6 +690,7 @@ impl ListenHandle {
 struct Inner {
     config: QefroConfig,
     tools: RwLock<HashMap<String, ToolRegistration>>,
+    flows: RwLock<HashMap<String, FlowRegistration>>,
     pending: Mutex<HashMap<String, PendingInvocation>>,
     auth_by_conversation: Mutex<HashMap<Uuid, StoredAuth>>,
     customer_provider: RwLock<Option<Arc<dyn CustomerProvider>>>,
@@ -624,6 +877,7 @@ impl Qefro {
             inner: Arc::new(Inner {
                 config,
                 tools: RwLock::new(HashMap::new()),
+                flows: RwLock::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
                 auth_by_conversation: Mutex::new(HashMap::new()),
                 customer_provider: RwLock::new(None),
@@ -664,6 +918,61 @@ impl Qefro {
             .expect("tools")
             .insert(name, registration);
         self
+    }
+
+    /// Register a Business Flow. Flows are metadata only: the SDK advertises them
+    /// through `capabilities.list` and the Qefro Runtime orchestrates execution.
+    ///
+    /// Returns [`FlowError`] on a duplicate or empty flow id — the SDK never panics.
+    pub fn flow(&self, metadata: BusinessFlowMetadata) -> std::result::Result<FlowBuilder, FlowError> {
+        let id = metadata.id.trim().to_string();
+        if id.is_empty() {
+            return Err(FlowError::EmptyFlowId);
+        }
+        {
+            let flows = self.inner.flows.read().expect("flows");
+            if flows.contains_key(&id) {
+                return Err(FlowError::DuplicateFlowId(id));
+            }
+        }
+        let version = if metadata.version == 0 { 1 } else { metadata.version };
+        let metadata = BusinessFlowMetadata {
+            id: id.clone(),
+            version,
+            ..metadata
+        };
+        self.inner.flows.write().expect("flows").insert(
+            id.clone(),
+            FlowRegistration {
+                metadata,
+                steps: Vec::new(),
+                error: None,
+            },
+        );
+        Ok(FlowBuilder {
+            inner: self.inner.clone(),
+            flow_id: id,
+        })
+    }
+
+    /// Snapshot the valid registered flows for `capabilities.list`. Flows with a
+    /// recorded builder error are excluded and logged.
+    fn list_registered_flows(&self) -> Vec<BusinessFlow> {
+        let flows = self.inner.flows.read().expect("flows");
+        flows
+            .values()
+            .filter_map(|reg| {
+                if let Some(err) = &reg.error {
+                    eprintln!("[qefro] skipping invalid flow \"{}\": {err}", reg.metadata.id);
+                    None
+                } else {
+                    Some(BusinessFlow {
+                        metadata: reg.metadata.clone(),
+                        steps: reg.steps.clone(),
+                    })
+                }
+            })
+            .collect()
     }
 
     pub fn before<F, Fut>(&self, hook: F) -> &Self
@@ -754,6 +1063,31 @@ impl Qefro {
                         .collect(),
                     protocol_version: self.inner.config.protocol_version.clone(),
                     sdk_version: SDK_VERSION.into(),
+                }
+            }
+            "capabilities.list" => {
+                let tools = {
+                    let tools = self.inner.tools.read().expect("tools");
+                    tools
+                        .values()
+                        .map(|r| RegisteredTool {
+                            name: r.metadata.name.clone(),
+                            description: r.metadata.description.clone(),
+                            input_schema: r.metadata.input_schema.clone(),
+                            authentication_methods: r.metadata.authentication_methods.clone(),
+                            auth: r.metadata.auth,
+                            permissions: r.metadata.permissions.clone(),
+                            timeout: r.metadata.timeout,
+                            lookup: r.metadata.lookup.clone(),
+                        })
+                        .collect()
+                };
+                QefroResponse::CapabilitiesList {
+                    tools,
+                    flows: self.list_registered_flows(),
+                    protocol_version: self.inner.config.protocol_version.clone(),
+                    sdk_version: SDK_VERSION.into(),
+                    sdk_name: SDK_NAME.into(),
                 }
             }
             "tool.invoke" => {
@@ -1326,5 +1660,171 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    fn capabilities_request() -> QefroRequest {
+        QefroRequest {
+            protocol_version: "1".into(),
+            request_id: Uuid::new_v4(),
+            request_type: "capabilities.list".into(),
+            organization_id: None,
+            conversation_id: None,
+            channel: None,
+            identity: None,
+            tool: None,
+            parameters: None,
+            authentication: None,
+            resume_token: None,
+            challenge_response: None,
+        }
+    }
+
+    fn order_lookup_metadata() -> BusinessFlowMetadata {
+        BusinessFlowMetadata {
+            id: "order_lookup".into(),
+            name: Some("Order Lookup".into()),
+            description: Some("Lookup customer orders".into()),
+            category: Some("crm".into()),
+            tags: vec!["customer".into(), "orders".into()],
+            intent: vec!["track order".into(), "where is my order".into()],
+            inputs: vec!["email".into()],
+            outputs: vec!["customer".into(), "orders".into()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn capabilities_list_advertises_flows() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.tool(
+            ToolMetadata {
+                name: "lookup_customer".into(),
+                ..Default::default()
+            },
+            |_ctx| async move { Ok(json!({})) },
+        );
+        app.flow(order_lookup_metadata())
+            .expect("flow registers")
+            .ask("email", "email", "Please enter your email.")
+            .tool("lookup", "lookup_customer")
+            .complete("done", None)
+            .expect("flow builds without error");
+
+        let resp = app.handle(capabilities_request()).await;
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(value["type"], "capabilities.list");
+        assert_eq!(value["flows"].as_array().unwrap().len(), 1);
+        let flow = &value["flows"][0];
+        // Wrapped { metadata, steps } shape with integer version.
+        assert_eq!(flow["metadata"]["id"], "order_lookup");
+        assert_eq!(flow["metadata"]["version"], 1);
+        assert!(flow["metadata"]["version"].is_number());
+        // { id, type, config } step model with tool_ref inside config.
+        assert_eq!(flow["steps"][0]["id"], "email");
+        assert_eq!(flow["steps"][0]["type"], "ask");
+        assert_eq!(flow["steps"][0]["config"]["field"], "email");
+        assert_eq!(flow["steps"][1]["type"], "tool");
+        assert_eq!(flow["steps"][1]["config"]["tool_ref"], "lookup_customer");
+        assert_eq!(flow["steps"][2]["type"], "complete");
+        assert!(flow["steps"][2]["config"].is_object());
+    }
+
+    #[test]
+    fn duplicate_flow_id_returns_error_no_panic() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.flow(order_lookup_metadata()).expect("first registers");
+        let err = app.flow(order_lookup_metadata()).err().unwrap();
+        assert_eq!(err, FlowError::DuplicateFlowId("order_lookup".into()));
+    }
+
+    #[test]
+    fn empty_flow_id_returns_error() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        let err = app
+            .flow(BusinessFlowMetadata {
+                id: "   ".into(),
+                ..Default::default()
+            })
+            .err()
+            .unwrap();
+        assert_eq!(err, FlowError::EmptyFlowId);
+    }
+
+    #[tokio::test]
+    async fn duplicate_step_id_surfaced_and_flow_excluded() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        let result = app
+            .flow(order_lookup_metadata())
+            .expect("flow registers")
+            .ask("email", "email", "Please enter your email.")
+            .tool("email", "lookup_customer") // duplicate step id
+            .complete("done", None);
+        assert_eq!(
+            result.unwrap_err(),
+            FlowError::DuplicateStepId {
+                flow: "order_lookup".into(),
+                step: "email".into()
+            }
+        );
+
+        // Invalid flow is excluded from capabilities.list (never crashes the server).
+        let resp = app.handle(capabilities_request()).await;
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(value["flows"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tools_list_unchanged_alongside_flows() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.tool(
+            ToolMetadata {
+                name: "lookup_customer".into(),
+                ..Default::default()
+            },
+            |_ctx| async move { Ok(json!({})) },
+        );
+        app.flow(order_lookup_metadata())
+            .expect("flow registers")
+            .tool("lookup", "lookup_customer")
+            .complete("done", None)
+            .expect("flow builds");
+
+        let resp = app
+            .handle(QefroRequest {
+                protocol_version: "1".into(),
+                request_id: Uuid::new_v4(),
+                request_type: "tools.list".into(),
+                organization_id: None,
+                conversation_id: None,
+                channel: None,
+                identity: None,
+                tool: None,
+                parameters: None,
+                authentication: None,
+                resume_token: None,
+                challenge_response: None,
+            })
+            .await;
+        let value = serde_json::to_value(&resp).expect("serialize");
+        // Legacy tools.list response carries no `flows` field.
+        assert_eq!(value["type"], "tools.list");
+        assert!(value.get("flows").is_none());
+        assert_eq!(value["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn flow_step_roundtrips_through_wire_shape() {
+        let step = FlowStep {
+            id: "lookup".into(),
+            kind: FlowStepKind::Tool {
+                tool_ref: "lookup_customer".into(),
+            },
+        };
+        let value = serde_json::to_value(&step).unwrap();
+        assert_eq!(value["id"], "lookup");
+        assert_eq!(value["type"], "tool");
+        assert_eq!(value["config"]["tool_ref"], "lookup_customer");
+        let back: FlowStep = serde_json::from_value(value).unwrap();
+        assert_eq!(back, step);
     }
 }
