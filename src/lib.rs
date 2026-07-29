@@ -626,6 +626,13 @@ impl FlowBuilder {
         self.push(id.into(), FlowStepKind::Approval { prompt })
     }
 
+    /// Append a non-final `complete` step and keep building. Use this for
+    /// branch terminals (e.g. a `condition` else-target) when more steps
+    /// follow; finish the chain with [`FlowBuilder::complete`].
+    pub fn complete_step(self, id: impl Into<String>, message: Option<String>) -> Self {
+        self.push(id.into(), FlowStepKind::Complete { message })
+    }
+
     /// Append the terminal `complete` step and surface any recorded builder error.
     #[must_use = "handle the FlowError so malformed flows fail fast at startup"]
     pub fn complete(self, id: impl Into<String>, message: Option<String>) -> Result<(), FlowError> {
@@ -1771,6 +1778,30 @@ mod tests {
         let resp = app.handle(capabilities_request()).await;
         let value = serde_json::to_value(&resp).expect("serialize");
         assert_eq!(value["flows"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_step_allows_branch_terminal_before_complete() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.flow(order_lookup_metadata())
+            .expect("flow registers")
+            .ask("ask", "order_id", "Order id?")
+            .tool("lookup", "order_status_check")
+            .condition(
+                "branch",
+                "order_status_check.found == true",
+                Some("ok".into()),
+                Some("missing".into()),
+            )
+            .complete_step("missing", Some("Not found.".into()))
+            .complete("ok", Some("Found.".into()))
+            .expect("flow builds with a mid-chain complete_step");
+
+        let resp = app.handle(capabilities_request()).await;
+        let value = serde_json::to_value(&resp).expect("serialize");
+        let steps = value["flows"][0]["steps"].as_array().unwrap();
+        let kinds: Vec<&str> = steps.iter().map(|s| s["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["ask", "tool", "condition", "complete", "complete"]);
     }
 
     #[tokio::test]

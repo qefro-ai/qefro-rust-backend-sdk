@@ -64,7 +64,7 @@ Set the same signing secret in Admin Console → **Business Tools → SDK Connec
 
 ## Business Flows
 
-Flows describe how your Business Tools are orchestrated. They are **metadata only** — the SDK advertises them through `capabilities.list` and the Qefro Runtime discovers, validates, versions, and (later) executes them. Nothing runs inside the SDK. A flow with a duplicate/empty id (flow or step) is excluded from `capabilities.list` and surfaced through `FlowError` instead of panicking.
+Flows describe how your Business Tools are orchestrated. They are **metadata only** — the SDK advertises them through `capabilities.list` and the Qefro Runtime discovers, validates, versions, and executes them. Nothing runs inside the SDK. A flow with a duplicate/empty id (flow or step) is excluded from `capabilities.list` and surfaced through `FlowError` instead of panicking.
 
 ```rust
 use qefro_backend_sdk::BusinessFlowMetadata;
@@ -86,12 +86,13 @@ app.flow(BusinessFlowMetadata {
 .complete("done", Some("Here are your recent orders.".into()))?;
 ```
 
-Every step needs a unique `id`; `tool` steps reference an existing Business Tool by `tool_ref`. Step builders: `.ask() .tool() .challenge() .upload() .condition() .delay() .approval() .complete()`. See [`examples/basic`](examples/basic).
+Every step needs a unique `id`; `tool` steps reference an existing Business Tool by `tool_ref`. Step builders: `.ask() .tool() .challenge() .upload() .condition() .delay() .approval() .complete_step() .complete()` — `complete_step()` adds a branch terminal mid-chain (e.g. a `condition` else-target), `complete()` finishes the flow and surfaces any `FlowError`. See [`examples/basic`](examples/basic) and [`examples/order-approval`](examples/order-approval) (condition + approval + OTP-authenticated tool).
 
 ## Docs
 
 - [Register SDK Business Tools](https://docs.qefro.com/docs/guides/register-sdk-business-tools)
 - [Define Business Flows](https://docs.qefro.com/docs/guides/define-business-flows)
+- [Run Business Flows](https://docs.qefro.com/docs/guides/run-business-flows)
 - [docs.rs/qefro-backend-sdk](https://docs.rs/qefro-backend-sdk)
 
 ## Protocol
@@ -112,6 +113,7 @@ Requests are HMAC-SHA256 signed (`X-Qefro-Signature` / `X-Qefro-Timestamp`). Res
 cargo build
 cargo test
 cargo run --example basic
+cargo run --example order-approval
 ```
 
 ## Publishing (maintainers)

@@ -1,6 +1,6 @@
 [package]
 name = "qefro-backend-sdk"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 description = "Qefro backend framework for business tool handlers and customer authorization orchestration"
 license = "MIT"
@@ -36,3 +36,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 [[example]]
 name = "basic"
 path = "examples/basic/main.rs"
+
+[[example]]
+name = "order-approval"
+path = "examples/order-approval/main.rs"
