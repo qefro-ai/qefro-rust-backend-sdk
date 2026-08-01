@@ -193,6 +193,82 @@ pub struct BusinessFlowMetadata {
     /// Values this flow produces (for analytics and future flow chaining).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<String>,
+    /// Entry trigger. Conversation (default) keeps Phase 2 behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<FlowTrigger>,
+}
+
+/// How a Business Flow is entered (Phase 3). Events are triggers into the
+/// Qefro runtime — not a second execution engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FlowTrigger {
+    Conversation,
+    Event {
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
+    },
+    Schedule { cron: String },
+    Webhook {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
+    },
+}
+
+impl FlowTrigger {
+    pub fn normalize(self) -> Result<Self, FlowError> {
+        match self {
+            FlowTrigger::Conversation => Ok(FlowTrigger::Conversation),
+            FlowTrigger::Event { event, when } => {
+                let event = event.trim().to_string();
+                if event.is_empty() {
+                    return Err(FlowError::InvalidTrigger(
+                        "trigger.type=event requires a non-empty event name".into(),
+                    ));
+                }
+                if !event.contains('.') {
+                    return Err(FlowError::InvalidTrigger(
+                        "trigger.event must be namespaced (e.g. shopify.order.created)".into(),
+                    ));
+                }
+                let when = when
+                    .map(|w| w.trim().to_string())
+                    .filter(|w| !w.is_empty());
+                Ok(FlowTrigger::Event { event, when })
+            }
+            FlowTrigger::Schedule { cron } => {
+                let cron = cron.trim().to_string();
+                if cron.is_empty() {
+                    return Err(FlowError::InvalidTrigger(
+                        "trigger.type=schedule requires a non-empty cron expression".into(),
+                    ));
+                }
+                Ok(FlowTrigger::Schedule { cron })
+            }
+            FlowTrigger::Webhook { name, when } => {
+                let name = name
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty());
+                let when = when
+                    .map(|w| w.trim().to_string())
+                    .filter(|w| !w.is_empty());
+                Ok(FlowTrigger::Webhook { name, when })
+            }
+        }
+    }
+}
+
+/// Standalone event / webhook / schedule handler advertised via capabilities.list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventHandlerDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
 }
 
 /// Type-specific settings for a flow step. Serialized as `{ "type": ..., "config": {...} }`
@@ -264,6 +340,9 @@ pub enum FlowError {
     DuplicateFlowId(String),
     EmptyStepId { flow: String },
     DuplicateStepId { flow: String, step: String },
+    InvalidTrigger(String),
+    EmptyHandlerName(&'static str),
+    DuplicateHandler { kind: &'static str, name: String },
 }
 
 impl std::fmt::Display for FlowError {
@@ -276,6 +355,13 @@ impl std::fmt::Display for FlowError {
             }
             FlowError::DuplicateStepId { flow, step } => {
                 write!(f, "flow \"{flow}\": duplicate step id \"{step}\"")
+            }
+            FlowError::InvalidTrigger(msg) => write!(f, "{msg}"),
+            FlowError::EmptyHandlerName(kind) => {
+                write!(f, "{kind}() requires a non-empty name")
+            }
+            FlowError::DuplicateHandler { kind, name } => {
+                write!(f, "{kind} \"{name}\" is already registered")
             }
         }
     }
@@ -344,6 +430,12 @@ pub enum QefroResponse {
     CapabilitiesList {
         tools: Vec<RegisteredTool>,
         flows: Vec<BusinessFlow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        events: Vec<EventHandlerDefinition>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        webhooks: Vec<EventHandlerDefinition>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        schedules: Vec<EventHandlerDefinition>,
         protocol_version: String,
         sdk_version: String,
         sdk_name: String,
@@ -698,6 +790,9 @@ struct Inner {
     config: QefroConfig,
     tools: RwLock<HashMap<String, ToolRegistration>>,
     flows: RwLock<HashMap<String, FlowRegistration>>,
+    events: RwLock<HashMap<String, EventHandlerDefinition>>,
+    webhooks: RwLock<HashMap<String, EventHandlerDefinition>>,
+    schedules: RwLock<HashMap<String, EventHandlerDefinition>>,
     pending: Mutex<HashMap<String, PendingInvocation>>,
     auth_by_conversation: Mutex<HashMap<Uuid, StoredAuth>>,
     customer_provider: RwLock<Option<Arc<dyn CustomerProvider>>>,
@@ -885,6 +980,9 @@ impl Qefro {
                 config,
                 tools: RwLock::new(HashMap::new()),
                 flows: RwLock::new(HashMap::new()),
+                events: RwLock::new(HashMap::new()),
+                webhooks: RwLock::new(HashMap::new()),
+                schedules: RwLock::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
                 auth_by_conversation: Mutex::new(HashMap::new()),
                 customer_provider: RwLock::new(None),
@@ -943,9 +1041,14 @@ impl Qefro {
             }
         }
         let version = if metadata.version == 0 { 1 } else { metadata.version };
+        let trigger = match metadata.trigger.clone() {
+            Some(t) => Some(t.normalize()?),
+            None => None,
+        };
         let metadata = BusinessFlowMetadata {
             id: id.clone(),
             version,
+            trigger,
             ..metadata
         };
         self.inner.flows.write().expect("flows").insert(
@@ -960,6 +1063,63 @@ impl Qefro {
             inner: self.inner.clone(),
             flow_id: id,
         })
+    }
+
+    /// Register a standalone event handler (advertised via capabilities.list).
+    /// The Qefro runtime owns delivery; connectors only emit into the bus.
+    pub fn event(&self, def: EventHandlerDefinition) -> std::result::Result<&Self, FlowError> {
+        self.register_named_handler("event", &self.inner.events, def)
+    }
+
+    /// Register a webhook alias (normalized to an orchestration event at ingest).
+    pub fn webhook(&self, def: EventHandlerDefinition) -> std::result::Result<&Self, FlowError> {
+        self.register_named_handler("webhook", &self.inner.webhooks, def)
+    }
+
+    /// Register a cron schedule. The runtime scheduler emits the named event.
+    pub fn schedule(&self, def: EventHandlerDefinition) -> std::result::Result<&Self, FlowError> {
+        let cron = def.cron.as_deref().unwrap_or("").trim();
+        if cron.is_empty() {
+            return Err(FlowError::InvalidTrigger(
+                "schedule() requires a non-empty cron expression".into(),
+            ));
+        }
+        self.register_named_handler("schedule", &self.inner.schedules, def)
+    }
+
+    fn register_named_handler(
+        &self,
+        kind: &'static str,
+        lock: &RwLock<HashMap<String, EventHandlerDefinition>>,
+        def: EventHandlerDefinition,
+    ) -> std::result::Result<&Self, FlowError> {
+        let name = def.name.trim().to_string();
+        if name.is_empty() {
+            return Err(FlowError::EmptyHandlerName(kind));
+        }
+        let mut map = lock.write().expect(kind);
+        if map.contains_key(&name) {
+            return Err(FlowError::DuplicateHandler { kind, name });
+        }
+        map.insert(
+            name.clone(),
+            EventHandlerDefinition {
+                name,
+                description: def.description,
+                cron: def.cron,
+            },
+        );
+        Ok(self)
+    }
+
+    fn list_named_handlers(
+        lock: &RwLock<HashMap<String, EventHandlerDefinition>>,
+    ) -> Vec<EventHandlerDefinition> {
+        lock.read()
+            .expect("handlers")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Snapshot the valid registered flows for `capabilities.list`. Flows with a
@@ -1092,6 +1252,9 @@ impl Qefro {
                 QefroResponse::CapabilitiesList {
                     tools,
                     flows: self.list_registered_flows(),
+                    events: Self::list_named_handlers(&self.inner.events),
+                    webhooks: Self::list_named_handlers(&self.inner.webhooks),
+                    schedules: Self::list_named_handlers(&self.inner.schedules),
                     protocol_version: self.inner.config.protocol_version.clone(),
                     sdk_version: SDK_VERSION.into(),
                     sdk_name: SDK_NAME.into(),
@@ -1755,6 +1918,51 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err, FlowError::EmptyFlowId);
+    }
+
+    #[tokio::test]
+    async fn capabilities_list_includes_event_triggers_and_handlers() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.flow(BusinessFlowMetadata {
+            id: "abandoned_cart".into(),
+            name: Some("Abandoned cart".into()),
+            trigger: Some(FlowTrigger::Event {
+                event: "shopify.cart.abandoned".into(),
+                when: None,
+            }),
+            ..Default::default()
+        })
+        .expect("flow")
+        .delay("wait", 60)
+        .complete("done", None)
+        .expect("build");
+
+        app.event(EventHandlerDefinition {
+            name: "shopify.cart.abandoned".into(),
+            description: Some("cart abandoned".into()),
+            cron: None,
+        })
+        .expect("event");
+        app.schedule(EventHandlerDefinition {
+            name: "nightly_sync".into(),
+            description: None,
+            cron: Some("0 2 * * *".into()),
+        })
+        .expect("schedule");
+
+        let resp = app.handle(capabilities_request()).await;
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(value["type"], "capabilities.list");
+        assert_eq!(
+            value["flows"][0]["metadata"]["trigger"]["type"],
+            "event"
+        );
+        assert_eq!(
+            value["flows"][0]["metadata"]["trigger"]["event"],
+            "shopify.cart.abandoned"
+        );
+        assert_eq!(value["events"][0]["name"], "shopify.cart.abandoned");
+        assert_eq!(value["schedules"][0]["cron"], "0 2 * * *");
     }
 
     #[tokio::test]
