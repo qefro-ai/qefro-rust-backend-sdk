@@ -3,6 +3,16 @@
 //! Organizations expose one signed webhook (typically `POST /qefro`).
 //! Qefro Runtime calls `ping`, `tools.list`, `tool.invoke`, and `tool.resume`.
 
+mod customer_hub;
+
+pub use customer_hub::{
+    env_flag_true, hub_call, hub_customer_from_person, is_customer_hub_enabled,
+    is_customer_hub_optional, pick_identity, read_identity_phone, seed_from_person,
+    ConsentContext, CustomerState, MembershipContext, PlatformCapabilities,
+    PlatformCustomerBinding, PlatformCustomerContext, PlatformStorageBinding,
+    PlatformStorageContext, TimelineContext,
+};
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -411,6 +421,12 @@ pub struct QefroRequest {
     pub authentication: Option<Value>,
     pub resume_token: Option<String>,
     pub challenge_response: Option<String>,
+    /// Customer Hub Person snapshot from Qefro memory (not connector customer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<Value>,
+    /// Managed storage / Customer Hub gateway for sdk.* bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<PlatformCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +478,8 @@ struct PendingInvocation {
     parameters: Value,
     identity: Option<Value>,
     channel: Option<String>,
+    platform: Option<PlatformCapabilities>,
+    person: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -487,6 +505,14 @@ pub struct ToolContext {
     /// Customer resolved for `auth = required` (or via in-handler authorize).
     pub customer: Option<Value>,
     customer_api: Option<CustomerApi>,
+    /// Append Customer Hub timeline activities.
+    pub timeline: TimelineContext,
+    /// Attach/detach solution membership on a Hub customer.
+    pub membership: MembershipContext,
+    /// Grant/revoke consent purposes on a Hub customer.
+    pub consent: ConsentContext,
+    /// Platform capabilities from `tool.invoke` (`platform.customer` / storage).
+    pub platform: Option<PlatformCapabilities>,
 }
 
 impl ToolContext {
@@ -802,6 +828,10 @@ struct Inner {
 }
 
 /// In-handler customer API (mirrors JS `ctx.customer`).
+///
+/// Hub methods (`resolve` / `create` / `update` / `note` / `tag`) talk to the
+/// platform Customer Hub via `platform.customer`. External `CustomerProvider`
+/// auth (`authorize` / provider `lookup`) is unchanged for connector CRMs.
 #[derive(Clone)]
 pub struct CustomerApi {
     app: Qefro,
@@ -811,24 +841,82 @@ pub struct CustomerApi {
     channel: Option<String>,
     auth_response: Option<String>,
     state: Arc<Mutex<CustomerState>>,
-}
-
-#[derive(Debug, Default)]
-struct CustomerState {
-    current: Option<Value>,
-    lookup_completed: bool,
+    platform: Option<PlatformCapabilities>,
 }
 
 impl CustomerApi {
-    pub async fn lookup(&self) -> Result<Option<Value>> {
+    async fn set_current(&self, customer: Option<Value>) -> Option<Value> {
+        let mut state = self.state.lock().await;
+        state.current = customer.clone();
+        state.lookup_completed = true;
+        customer
+    }
+
+    async fn require_current_id(&self) -> Result<String> {
+        let state = self.state.lock().await;
+        if let Some(id) = state
+            .current
+            .as_ref()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(id.to_string());
+        }
+        Err(anyhow!("customer_not_found"))
+    }
+
+    /// Resolve-or-create Customer Hub identity (preferred for apps).
+    pub async fn resolve(&self, input: Option<Value>) -> Result<Option<Value>> {
+        let identity = pick_identity(input.as_ref(), &self.identity);
+        let mut body = Value::Object(identity);
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(ch) = self.channel.as_ref() {
+                obj.insert("channel".into(), json!(ch));
+            }
+            obj.insert("conversation_id".into(), json!(self.conversation_id.to_string()));
+        }
+        let out = hub_call(self.platform.as_ref(), "resolve", body).await?;
+        let hub = hub_customer_from_person(out.as_ref());
+        if hub.is_some() {
+            self.set_current(hub.clone()).await;
+        }
+        Ok(hub)
+    }
+
+    /// Lookup only (no create). Hub when args / hub-only; else external provider.
+    pub async fn lookup(&self, input: Option<Value>) -> Result<Option<Value>> {
         let provider = self
             .app
             .inner
             .customer_provider
             .read()
             .expect("customer_provider")
-            .clone()
-            .ok_or_else(|| anyhow!("customer_provider_missing"))?;
+            .clone();
+
+        if input.is_some() || provider.is_none() {
+            {
+                let state = self.state.lock().await;
+                if state.lookup_completed && input.is_none() && state.current.is_some() {
+                    return Ok(state.current.clone());
+                }
+            }
+            let identity = pick_identity(input.as_ref(), &self.identity);
+            let mut body = Value::Object(identity);
+            if let Some(obj) = body.as_object_mut() {
+                if let Some(ch) = self.channel.as_ref() {
+                    obj.insert("channel".into(), json!(ch));
+                }
+                obj.insert(
+                    "conversation_id".into(),
+                    json!(self.conversation_id.to_string()),
+                );
+            }
+            let out = hub_call(self.platform.as_ref(), "lookup", body).await?;
+            let hub = hub_customer_from_person(out.as_ref());
+            self.set_current(hub.clone()).await;
+            return Ok(hub);
+        }
 
         {
             let state = self.state.lock().await;
@@ -838,6 +926,7 @@ impl CustomerApi {
         }
 
         let customer = provider
+            .unwrap()
             .lookup(&CustomerLookupContext {
                 identity: self.identity.clone(),
                 parameters: self.parameters.clone(),
@@ -848,31 +937,13 @@ impl CustomerApi {
             })
             .await?;
 
-        let mut state = self.state.lock().await;
-        state.current = customer.clone();
-        state.lookup_completed = true;
-        Ok(customer)
+        Ok(self.set_current(customer).await)
     }
 
     pub async fn lookup_by_phone(&self, phone: Option<&str>) -> Result<Option<Value>> {
-        let provider = self
-            .app
-            .inner
-            .customer_provider
-            .read()
-            .expect("customer_provider")
-            .clone()
-            .ok_or_else(|| anyhow!("customer_provider_missing"))?;
-
         let source = phone
             .map(str::to_string)
-            .or_else(|| {
-                self.identity
-                    .get("phone")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.trim().is_empty())
-                    .map(str::to_string)
-            });
+            .or_else(|| read_identity_phone(&self.identity));
 
         let Some(source) = source else {
             let mut state = self.state.lock().await;
@@ -881,12 +952,30 @@ impl CustomerApi {
             return Ok(None);
         };
 
+        let provider = self
+            .app
+            .inner
+            .customer_provider
+            .read()
+            .expect("customer_provider")
+            .clone();
+
+        if provider.is_none() || is_customer_hub_enabled() {
+            return self
+                .lookup(Some(json!({
+                    "phone_number": source,
+                    "whatsapp_number": source,
+                })))
+                .await;
+        }
+
         let mut identity = self.identity.clone();
         if let Some(obj) = identity.as_object_mut() {
             obj.insert("phone".into(), json!(source));
         }
 
         let customer = provider
+            .unwrap()
             .lookup(&CustomerLookupContext {
                 identity,
                 parameters: self.parameters.clone(),
@@ -897,10 +986,122 @@ impl CustomerApi {
             })
             .await?;
 
-        let mut state = self.state.lock().await;
-        state.current = customer.clone();
-        state.lookup_completed = true;
-        Ok(customer)
+        Ok(self.set_current(customer).await)
+    }
+
+    pub async fn create(&self, input: Value) -> Result<Option<Value>> {
+        let identity = pick_identity(Some(&input), &self.identity);
+        let mut body = Value::Object(identity);
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(ch) = self.channel.as_ref() {
+                obj.insert("channel".into(), json!(ch));
+            }
+            obj.insert(
+                "conversation_id".into(),
+                json!(self.conversation_id.to_string()),
+            );
+        }
+        let out = hub_call(self.platform.as_ref(), "create", body).await?;
+        let hub = hub_customer_from_person(out.as_ref());
+        if hub.is_some() {
+            self.set_current(hub.clone()).await;
+        }
+        Ok(hub)
+    }
+
+    pub async fn update(&self, input: Value) -> Result<Option<Value>> {
+        let id = input
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                // filled from state below
+                None
+            });
+        let id = match id {
+            Some(id) => id,
+            None => {
+                let state = self.state.lock().await;
+                match state
+                    .current
+                    .as_ref()
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                {
+                    Some(id) => id,
+                    None if is_customer_hub_optional() => return Ok(None),
+                    None => return Err(anyhow!("customer_not_found")),
+                }
+            }
+        };
+        let identity = pick_identity(Some(&input), &self.identity);
+        let mut body = Value::Object(identity);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("id".into(), json!(id));
+        }
+        let out = hub_call(self.platform.as_ref(), "update", body).await?;
+        let hub = hub_customer_from_person(out.as_ref());
+        if hub.is_some() {
+            self.set_current(hub.clone()).await;
+        }
+        Ok(hub)
+    }
+
+    pub async fn note(&self, content: &str, options: Option<Value>) -> Result<()> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("customer_note_empty"));
+        }
+        let customer_id = match self.require_current_id().await {
+            Ok(id) => id,
+            Err(_err) if is_customer_hub_optional() => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let author_id = options
+            .as_ref()
+            .and_then(|v| v.get("author_id"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        hub_call(
+            self.platform.as_ref(),
+            "note",
+            json!({
+                "customer_id": customer_id,
+                "content": trimmed,
+                "author_id": author_id,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn tag(&self, name: &str, options: Option<Value>) -> Result<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("customer_tag_empty"));
+        }
+        let customer_id = match self.require_current_id().await {
+            Ok(id) => id,
+            Err(_err) if is_customer_hub_optional() => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let color = options
+            .as_ref()
+            .and_then(|v| v.get("color"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        hub_call(
+            self.platform.as_ref(),
+            "tag",
+            json!({
+                "customer_id": customer_id,
+                "name": trimmed,
+                "color": color,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn authorize(&self, method: Option<String>) -> Result<Value> {
@@ -926,7 +1127,7 @@ impl CustomerApi {
         }
 
         let customer = self
-            .lookup()
+            .lookup(None)
             .await?
             .ok_or_else(|| anyhow!("customer_not_found"))?;
 
@@ -965,6 +1166,37 @@ impl CustomerApi {
         self.get()
             .await
             .ok_or_else(|| anyhow!("customer_not_found"))
+    }
+
+    /// Convenience: Hub / provider customer `id` when available.
+    pub async fn id(&self) -> Option<String> {
+        self.get()
+            .await
+            .and_then(|v| v.get("id")?.as_str().map(str::to_string))
+    }
+
+    pub async fn phone_number(&self) -> Option<String> {
+        self.get().await.and_then(|v| {
+            v.get("phone_number")?
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| v.get("phone")?.as_str().map(str::to_string))
+        })
+    }
+
+    pub async fn whatsapp_number(&self) -> Option<String> {
+        self.get()
+            .await
+            .and_then(|v| v.get("whatsapp_number")?.as_str().map(str::to_string))
+    }
+
+    pub async fn display_name(&self) -> Option<String> {
+        self.get().await.and_then(|v| {
+            v.get("display_name")?
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| v.get("name")?.as_str().map(str::to_string))
+        })
     }
 }
 
@@ -1269,6 +1501,8 @@ impl Qefro {
                     request.channel,
                     request.authentication,
                     None,
+                    request.platform,
+                    request.person,
                 )
                 .await
             }
@@ -1303,6 +1537,8 @@ impl Qefro {
                     pending.channel,
                     request.authentication,
                     Some(challenge_response),
+                    request.platform.or(pending.platform),
+                    request.person.or(pending.person),
                 )
                 .await
             }
@@ -1414,6 +1650,8 @@ impl Qefro {
         channel: Option<String>,
         authentication: Option<Value>,
         auth_response: Option<String>,
+        platform: Option<PlatformCapabilities>,
+        person: Option<Value>,
     ) -> QefroResponse {
         let Some(tool_name) = tool else {
             return QefroResponse::Error {
@@ -1447,6 +1685,15 @@ impl Qefro {
             }
         }
 
+        // Seed hub customer from Person snapshot when present (native chat path).
+        if let Some(ref person_val) = person {
+            if let Some(seeded) = seed_from_person(person_val) {
+                let mut state = customer_state.lock().await;
+                state.current = Some(seeded);
+                state.lookup_completed = true;
+            }
+        }
+
         let customer_api = CustomerApi {
             app: self.clone(),
             identity: identity_value.clone(),
@@ -1455,6 +1702,7 @@ impl Qefro {
             channel: channel.clone(),
             auth_response: auth_response.clone(),
             state: customer_state.clone(),
+            platform: platform.clone(),
         };
 
         let mut current_customer = customer_state.lock().await.current.clone();
@@ -1465,9 +1713,49 @@ impl Qefro {
                 .await
             {
                 Ok(customer) => current_customer = Some(customer),
-                Err(e) => return map_invoke_error(e, self, &tool_name, &parameters, conversation_id, identity.clone(), channel.clone()).await,
+                Err(e) => {
+                    return map_invoke_error(
+                        e,
+                        self,
+                        &tool_name,
+                        &parameters,
+                        conversation_id,
+                        identity.clone(),
+                        channel.clone(),
+                        platform.clone(),
+                        person.clone(),
+                    )
+                    .await
+                }
             }
         }
+
+        let solution_id = platform
+            .as_ref()
+            .and_then(|p| p.customer.as_ref())
+            .and_then(|c| c.context.as_ref())
+            .and_then(|c| c.solution_id.clone())
+            .or_else(|| {
+                platform
+                    .as_ref()
+                    .and_then(|p| p.storage.as_ref())
+                    .and_then(|s| s.context.as_ref())
+                    .map(|c| c.solution_id.clone())
+            });
+
+        let timeline = TimelineContext {
+            platform: platform.clone(),
+            state: customer_state.clone(),
+        };
+        let membership = MembershipContext {
+            platform: platform.clone(),
+            state: customer_state.clone(),
+            solution_id,
+        };
+        let consent = ConsentContext {
+            platform: platform.clone(),
+            state: customer_state.clone(),
+        };
 
         let ctx = ToolContext {
             identity: identity_value,
@@ -1480,12 +1768,27 @@ impl Qefro {
             auth_response,
             customer: current_customer,
             customer_api: Some(customer_api),
+            timeline,
+            membership,
+            consent,
+            platform: platform.clone(),
         };
 
         let before_hooks = self.inner.before_hooks.read().expect("before_hooks").clone();
         for hook in &before_hooks {
             if let Err(e) = hook(ctx.clone()).await {
-                return map_invoke_error(e, self, &tool_name, &parameters, conversation_id, identity.clone(), channel.clone()).await;
+                return map_invoke_error(
+                    e,
+                    self,
+                    &tool_name,
+                    &parameters,
+                    conversation_id,
+                    identity.clone(),
+                    channel.clone(),
+                    platform.clone(),
+                    person.clone(),
+                )
+                .await;
             }
         }
 
@@ -1504,6 +1807,8 @@ impl Qefro {
                     conversation_id,
                     identity,
                     channel,
+                    platform,
+                    person,
                 )
                 .await;
             }
@@ -1523,6 +1828,8 @@ impl Qefro {
                         conversation_id,
                         identity,
                         channel,
+                        platform,
+                        person,
                     )
                     .await;
                 }
@@ -1582,6 +1889,8 @@ impl Qefro {
                             parameters,
                             identity: pending_identity,
                             channel: pending_channel,
+                            platform: None,
+                            person: None,
                         },
                     );
                     // Encode resume in error path via ChallengeSignal — callers for required-auth
@@ -1627,6 +1936,8 @@ impl Qefro {
                         parameters,
                         identity,
                         channel,
+                        platform: None,
+                        person: None,
                     },
                 );
                 Err(QefroResponse::Challenge {
@@ -1654,6 +1965,8 @@ async fn map_invoke_error(
     conversation_id: Uuid,
     identity: Option<Value>,
     channel: Option<String>,
+    platform: Option<PlatformCapabilities>,
+    person: Option<Value>,
 ) -> QefroResponse {
     if let Some(signal) = e.downcast_ref::<ChallengeSignal>() {
         let resume_token = Uuid::new_v4().to_string();
@@ -1665,6 +1978,8 @@ async fn map_invoke_error(
                 parameters: parameters.clone(),
                 identity,
                 channel,
+                platform,
+                person,
             },
         );
         return QefroResponse::Challenge {
@@ -1817,6 +2132,8 @@ mod tests {
                 authentication: None,
                 resume_token: None,
                 challenge_response: None,
+                person: None,
+                platform: None,
             })
             .await;
 
@@ -1846,6 +2163,8 @@ mod tests {
             authentication: None,
             resume_token: None,
             challenge_response: None,
+            person: None,
+            platform: None,
         }
     }
 
@@ -2042,6 +2361,8 @@ mod tests {
                 authentication: None,
                 resume_token: None,
                 challenge_response: None,
+                person: None,
+                platform: None,
             })
             .await;
         let value = serde_json::to_value(&resp).expect("serialize");
@@ -2065,5 +2386,146 @@ mod tests {
         assert_eq!(value["config"]["tool_ref"], "lookup_customer");
         let back: FlowStep = serde_json::from_value(value).unwrap();
         assert_eq!(back, step);
+    }
+
+    #[tokio::test]
+    async fn customer_hub_resolve_soft_skips_when_disabled() {
+        let _guard = customer_hub::HUB_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("QEFRO_CUSTOMER_HUB_ENABLED", "false");
+        std::env::set_var("QEFRO_CUSTOMER_HUB_OPTIONAL", "true");
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.tool(
+            ToolMetadata {
+                name: "hub_probe".into(),
+                auth: ToolAuthMode::None,
+                ..Default::default()
+            },
+            |ctx| async move {
+                let api = ctx.customer_api().unwrap();
+                let out = api.resolve(Some(json!({"phone_number": "+1"}))).await?;
+                Ok(json!({ "customer": out }))
+            },
+        );
+        let resp = app
+            .handle(QefroRequest {
+                protocol_version: "1".into(),
+                request_id: Uuid::new_v4(),
+                request_type: "tool.invoke".into(),
+                organization_id: None,
+                conversation_id: None,
+                channel: None,
+                identity: None,
+                tool: Some("hub_probe".into()),
+                parameters: Some(json!({})),
+                authentication: None,
+                resume_token: None,
+                challenge_response: None,
+                person: None,
+                platform: None,
+            })
+            .await;
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["type"], "result");
+        assert!(value["output"]["customer"].is_null());
+        std::env::remove_var("QEFRO_CUSTOMER_HUB_ENABLED");
+        std::env::remove_var("QEFRO_CUSTOMER_HUB_OPTIONAL");
+    }
+
+    #[tokio::test]
+    async fn customer_hub_person_seed_exposes_properties() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.tool(
+            ToolMetadata {
+                name: "who".into(),
+                auth: ToolAuthMode::None,
+                ..Default::default()
+            },
+            |ctx| async move {
+                let api = ctx.customer_api().unwrap();
+                Ok(json!({
+                    "id": api.id().await,
+                    "phone_number": api.phone_number().await,
+                    "display_name": api.display_name().await,
+                }))
+            },
+        );
+        let resp = app
+            .handle(QefroRequest {
+                protocol_version: "1".into(),
+                request_id: Uuid::new_v4(),
+                request_type: "tool.invoke".into(),
+                organization_id: None,
+                conversation_id: None,
+                channel: None,
+                identity: None,
+                tool: Some("who".into()),
+                parameters: Some(json!({})),
+                authentication: None,
+                resume_token: None,
+                challenge_response: None,
+                person: Some(json!({
+                    "id": "cust-1",
+                    "phone": "+1999",
+                    "name": "Sam",
+                })),
+                platform: None,
+            })
+            .await;
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["output"]["id"], "cust-1");
+        assert_eq!(value["output"]["phone_number"], "+1999");
+        assert_eq!(value["output"]["display_name"], "Sam");
+    }
+
+    #[tokio::test]
+    async fn customer_hub_timeline_noop_when_optional_no_customer() {
+        let _guard = customer_hub::HUB_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("QEFRO_CUSTOMER_HUB_ENABLED", "true");
+        std::env::set_var("QEFRO_CUSTOMER_HUB_OPTIONAL", "true");
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.tool(
+            ToolMetadata {
+                name: "hub_side".into(),
+                auth: ToolAuthMode::None,
+                ..Default::default()
+            },
+            |ctx| async move {
+                ctx.timeline
+                    .append(json!({"event_type": "x.y"}))
+                    .await?;
+                ctx.membership.attach(None).await?;
+                ctx.consent
+                    .grant(json!({"purpose": "marketing"}))
+                    .await?;
+                Ok(json!({"ok": true}))
+            },
+        );
+        let resp = app
+            .handle(QefroRequest {
+                protocol_version: "1".into(),
+                request_id: Uuid::new_v4(),
+                request_type: "tool.invoke".into(),
+                organization_id: None,
+                conversation_id: None,
+                channel: None,
+                identity: None,
+                tool: Some("hub_side".into()),
+                parameters: Some(json!({})),
+                authentication: None,
+                resume_token: None,
+                challenge_response: None,
+                person: None,
+                platform: None,
+            })
+            .await;
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["type"], "result");
+        assert_eq!(value["output"]["ok"], true);
+        std::env::remove_var("QEFRO_CUSTOMER_HUB_ENABLED");
+        std::env::remove_var("QEFRO_CUSTOMER_HUB_OPTIONAL");
     }
 }

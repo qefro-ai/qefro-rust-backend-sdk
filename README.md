@@ -62,6 +62,47 @@ async fn main() -> anyhow::Result<()> {
 
 Set the same signing secret in Admin Console → **Business Tools → SDK Connections**, then **Sync Tools**.
 
+## Customer Hub (optional)
+
+When `QEFRO_CUSTOMER_HUB_ENABLED=true`, tools can call Hub via
+`platform.customer` on `tool.invoke` (or `QEFRO_CUSTOMER_HUB_URL` + service
+token). Hub is **optional** — defaults keep existing apps working
+(`ENABLED=false`, `OPTIONAL=true`). Soft-skip returns `None` / no-ops when
+Hub is off or unreachable; set `QEFRO_CUSTOMER_HUB_OPTIONAL=false` to hard-fail.
+
+```rust
+app.tool(
+    ToolMetadata {
+        name: "create_reservation".into(),
+        auth: ToolAuthMode::None,
+        ..Default::default()
+    },
+    |ctx| async move {
+        let api = ctx.customer_api().unwrap();
+        let customer = api
+            .resolve(Some(json!({ "whatsapp_number": ctx.identity.get("phone") })))
+            .await?;
+        // Convenience: api.id() / phone_number() / whatsapp_number() / display_name()
+        ctx.timeline
+            .append(json!({
+                "event_type": "reservation.created",
+                "payload": { "code": "R-1001" },
+            }))
+            .await?;
+        ctx.membership
+            .attach(Some(json!({ "solution_id": "restaurant-pro" })))
+            .await?;
+        ctx.consent
+            .grant(json!({ "purpose": "marketing" }))
+            .await?;
+        Ok(json!({ "customer_id": customer.and_then(|c| c.get("id").cloned()) }))
+    },
+);
+```
+
+Storage bindings (when present in your stack) remain independent — Hub is never
+the sole path. External CRM auth via `app.customer(provider)` is unchanged.
+
 ## Business Flows
 
 Flows describe how your Business Tools are orchestrated. They are **metadata only** — the SDK advertises them through `capabilities.list` and the Qefro Runtime discovers, validates, versions, and executes them. Nothing runs inside the SDK. A flow with a duplicate/empty id (flow or step) is excluded from `capabilities.list` and surfaced through `FlowError` instead of panicking.
