@@ -4,6 +4,7 @@
 //! Qefro Runtime calls `ping`, `tools.list`, `tool.invoke`, and `tool.resume`.
 
 mod customer_hub;
+mod marketing;
 
 pub use customer_hub::{
     env_flag_true, hub_call, hub_customer_from_person, is_customer_hub_enabled,
@@ -11,6 +12,12 @@ pub use customer_hub::{
     ConsentContext, CustomerState, MembershipContext, PlatformCapabilities,
     PlatformCustomerBinding, PlatformCustomerContext, PlatformStorageBinding,
     PlatformStorageContext, TimelineContext,
+};
+pub use marketing::{
+    to_marketing_capability, validate_marketing_definition, MarketingAction,
+    MarketingAudience, MarketingAudienceAppQuery, MarketingAudienceCustomerHub,
+    MarketingCapability, MarketingChannel, MarketingDefinition, MarketingError,
+    MarketingLandingPage, MarketingMetadata, MarketingRegistration, MarketingVariable,
 };
 
 use std::collections::HashMap;
@@ -452,6 +459,9 @@ pub enum QefroResponse {
         webhooks: Vec<EventHandlerDefinition>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         schedules: Vec<EventHandlerDefinition>,
+        /// Present when `app.marketing(...)` was registered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        marketing: Option<MarketingCapability>,
         protocol_version: String,
         sdk_version: String,
         sdk_name: String,
@@ -819,6 +829,7 @@ struct Inner {
     events: RwLock<HashMap<String, EventHandlerDefinition>>,
     webhooks: RwLock<HashMap<String, EventHandlerDefinition>>,
     schedules: RwLock<HashMap<String, EventHandlerDefinition>>,
+    marketing: RwLock<Option<MarketingRegistration>>,
     pending: Mutex<HashMap<String, PendingInvocation>>,
     auth_by_conversation: Mutex<HashMap<Uuid, StoredAuth>>,
     customer_provider: RwLock<Option<Arc<dyn CustomerProvider>>>,
@@ -1215,6 +1226,7 @@ impl Qefro {
                 events: RwLock::new(HashMap::new()),
                 webhooks: RwLock::new(HashMap::new()),
                 schedules: RwLock::new(HashMap::new()),
+                marketing: RwLock::new(None),
                 pending: Mutex::new(HashMap::new()),
                 auth_by_conversation: Mutex::new(HashMap::new()),
                 customer_provider: RwLock::new(None),
@@ -1232,6 +1244,22 @@ impl Qefro {
         *self.inner.customer_provider.write().expect("customer_provider") =
             Some(Arc::new(provider));
         self
+    }
+
+    /// Register Marketing metadata (ADR-004 Phase 1). Metadata only — advertised
+    /// through `capabilities.list.marketing`; the platform owns campaigns.
+    pub fn marketing(
+        &self,
+        def: MarketingDefinition,
+    ) -> std::result::Result<&Self, MarketingError> {
+        let mut slot = self.inner.marketing.write().expect("marketing");
+        if slot.is_some() {
+            return Err(MarketingError::Message(
+                "marketing() may only be called once".into(),
+            ));
+        }
+        *slot = Some(validate_marketing_definition(def)?);
+        Ok(self)
     }
 
     pub fn tool<F, Fut>(&self, metadata: ToolMetadata, handler: F) -> &Self
@@ -1487,6 +1515,13 @@ impl Qefro {
                     events: Self::list_named_handlers(&self.inner.events),
                     webhooks: Self::list_named_handlers(&self.inner.webhooks),
                     schedules: Self::list_named_handlers(&self.inner.schedules),
+                    marketing: self
+                        .inner
+                        .marketing
+                        .read()
+                        .expect("marketing")
+                        .as_ref()
+                        .map(to_marketing_capability),
                     protocol_version: self.inner.config.protocol_version.clone(),
                     sdk_version: SDK_VERSION.into(),
                     sdk_name: SDK_NAME.into(),
@@ -2282,6 +2317,52 @@ mod tests {
         );
         assert_eq!(value["events"][0]["name"], "shopify.cart.abandoned");
         assert_eq!(value["schedules"][0]["cron"], "0 2 * * *");
+    }
+
+    #[tokio::test]
+    async fn capabilities_list_includes_marketing_metadata() {
+        let app = Qefro::new(QefroConfig::new("secret"));
+        app.marketing(MarketingDefinition {
+            version: Some(1),
+            audiences: vec![MarketingAudience {
+                id: "vip".into(),
+                label: "VIP".into(),
+                description: None,
+                source: "customer_hub".into(),
+                customer_hub: None,
+                app_query: None,
+                static_filter: None,
+            }],
+            variables: vec![],
+            actions: vec![],
+            landing_pages: vec![],
+            channels: vec![
+                MarketingChannel {
+                    id: "whatsapp".into(),
+                    provider: Some("meta".into()),
+                    label: None,
+                    enabled: Some(true),
+                },
+                MarketingChannel {
+                    id: "email".into(),
+                    provider: Some("sendgrid".into()),
+                    label: None,
+                    enabled: Some(true),
+                },
+            ],
+        })
+        .expect("marketing");
+
+        let resp = app.handle(capabilities_request()).await;
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(value["type"], "capabilities.list");
+        assert_eq!(value["marketing"]["version"], 1);
+        assert_eq!(value["marketing"]["metadata"]["audiences"][0]["id"], "vip");
+        assert_eq!(
+            value["marketing"]["metadata"]["channels"][0]["provider"],
+            "meta"
+        );
+        assert!(value["marketing"].get("audiences").is_none());
     }
 
     #[tokio::test]
